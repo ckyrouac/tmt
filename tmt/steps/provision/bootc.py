@@ -18,8 +18,6 @@ if TYPE_CHECKING:
     from tmt.hardware import Size
 
 DEFAULT_TMP_PATH = "/var/tmp/tmt"  # noqa: S108
-
-DEFAULT_IMAGE_BUILDER = "quay.io/centos-bootc/bootc-image-builder:latest"
 CONTAINER_STORAGE_DIR = tmt.utils.Path("/var/lib/containers/storage")
 
 PODMAN_MACHINE_NAME = 'podman-machine-tmt'
@@ -94,7 +92,7 @@ class BootcData(tmt.steps.provision.testcloud.ProvisionTestcloudData):
         metavar='CONTAINERFILE',
         help="""
              Select container file to be used to build a container image
-             that is then used by bootc image builder to create a disk image.
+             that is then used by bootc install to create a disk image.
 
              Cannot be used with containerimage.
              """)
@@ -126,13 +124,16 @@ class BootcData(tmt.steps.provision.testcloud.ProvisionTestcloudData):
              This will cause a derived image to be built from the supplied image.
              """)
 
-    image_builder: str = field(
-        default=DEFAULT_IMAGE_BUILDER,
-        option=('--image-builder'),
-        metavar='IMAGEBUILDER',
+    install_opts: Optional[str] = field(
+        default=None,
+        option=('--install-opts'),
+        metavar='INSTALLOPTS',
         help="""
-             The full repo:tag url of the bootc image builder image to use for
-             building the bootc disk image.
+             Additional options to pass to the invocation of bootc install.
+             These are passed directly to bootc install to-disk so pay close attention
+             to the format of the string. Here's an example:
+
+             --karg=nosmt --karg=console=ttyS0,114800n8
              """)
 
 
@@ -251,31 +252,68 @@ class ProvisionBootc(tmt.steps.provision.ProvisionPlugin[BootcData]):
             env=PODMAN_ENV if self._rootless else None)
         return image_tag
 
-    def _build_bootc_disk(self, containerimage: str, image_builder: str) -> None:
-        """ Build the bootc disk from a container image using bootc image builder """
+    def _build_bootc_disk(self, containerimage: str) -> None:
+        """ Build the bootc disk from a container image using bootc install """
         self._logger.debug("Building bootc disk image")
 
         tmt.utils.Command(
+            "truncate",
+            "-s",
+            "10G",
+            "disk.raw"
+            ).run(
+            log=self._logger.verbose,
+            cwd=self.workdir,
+            stream_output=True,
+            logger=self._logger)
+
+        install_args = [
             "podman",
             "run",
-            "--rm",
+            "--pid=host",
+            "--network=host",
             "--privileged",
-            "-v",
-            f'{CONTAINER_STORAGE_DIR}:{CONTAINER_STORAGE_DIR}',
             "--security-opt",
             "label=type:unconfined_t",
             "-v",
+            f'{CONTAINER_STORAGE_DIR}:{CONTAINER_STORAGE_DIR}',
+            "-v",
             f"{self.workdir}:/output",
-            image_builder,
-            "build",
-            "--type",
-            "qcow2",
-            "--local",
-            containerimage).run(
+            "-v",
+            "/dev:/dev",
+            containerimage,
+            "bootc",
+            "install",
+            "to-disk",
+            "--via-loopback",
+            "--generic-image",
+            "--skip-fetch-check",
+            ]
+        if self.data.install_opts:
+            for opt in self.data.install_opts.split(" "):
+                install_args.append(opt)
+
+        install_args.append("/output/disk.raw")
+
+        tmt.utils.Command(*install_args).run(
+            log=self._logger.verbose,
             cwd=self.workdir,
             stream_output=True,
             logger=self._logger,
             env=PODMAN_ENV if self._rootless else None)
+
+        tmt.utils.Command(
+            "qemu-img",
+            "convert",
+            "-O",
+            "qcow2",
+            "disk.raw",
+            "disk.qcow2"
+            ).run(
+            log=self._logger.verbose,
+            cwd=self.workdir,
+            stream_output=True,
+            logger=self._logger)
 
     def _init_podman_machine(self) -> None:
         try:
@@ -314,7 +352,7 @@ class ProvisionBootc(tmt.steps.provision.ProvisionPlugin[BootcData]):
         self._check_if_podman_is_rootless()
 
         data = BootcData.from_plugin(self)
-        data.image = f"file://{self.workdir}/qcow2/disk.qcow2"
+        data.image = f"file://{self.workdir}/disk.qcow2"
         data.show(verbose=self.verbosity_level, logger=self._logger)
 
         if self._rootless:
@@ -324,12 +362,12 @@ class ProvisionBootc(tmt.steps.provision.ProvisionPlugin[BootcData]):
             containerimage = data.containerimage
             if data.add_deps:
                 containerimage = self._build_derived_image(data.containerimage)
-            self._build_bootc_disk(containerimage, data.image_builder)
+            self._build_bootc_disk(containerimage)
         elif data.containerfile is not None:
             containerimage = self._build_base_image(data.containerfile, data.containerfile_workdir)
             if data.add_deps:
                 containerimage = self._build_derived_image(containerimage)
-            self._build_bootc_disk(containerimage, data.image_builder)
+            self._build_bootc_disk(containerimage)
         else:
             raise tmt.utils.ProvisionError(
                 "Either containerfile or containerimage must be specified.")
